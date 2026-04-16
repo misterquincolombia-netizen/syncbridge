@@ -208,6 +208,7 @@ app.delete('/api/logs', (req, res) => { syncLogs.length = 0; res.json({ ok: true
 app.get('/api/config', (req, res) => res.json({ shopifyShop: CONFIG.shopifyShop, dolibarrUrl: CONFIG.dolibarrUrl.replace(/\/api.*$/, ''), integrationActive: CONFIG.integrationActive }));
 app.post('/api/toggle', (req, res) => { CONFIG.integrationActive = !CONFIG.integrationActive; res.json({ active: CONFIG.integrationActive }); });
 
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 // Puerto dinamico de Railway
 const PORT = process.env.PORT || 3099;
 app.listen(PORT, () => console.log('SyncBridge corriendo en puerto ' + PORT));
