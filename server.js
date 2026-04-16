@@ -7,7 +7,6 @@ const path = require('path');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 // Servir el archivo HTML
-app.use(express.static(path.join(__dirname)));
 
 // =============================================
 // CONFIGURACION (Railway inyecta esto automaticamente)
