@@ -2,367 +2,212 @@ const express = require('express');
 const crypto = require('crypto');
 const https = require('https');
 const http = require('http');
+const path = require('path');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+// Servir el archivo HTML
+app.use(express.static(path.join(__dirname)));
 
 // =============================================
-// CONFIGURACION — Railway lee estas variables de entorno
+// CONFIGURACION (Railway inyecta esto automaticamente)
 // =============================================
 const CONFIG = {
-  shopifyShop: process.env.SHOP_NAME || 'mi-tienda',
+  shopifyShop: process.env.SHOP_NAME || '',
   shopifyApiKey: process.env.SHOPIFY_API_KEY || '',
   shopifyWebhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET || '',
   dolibarrUrl: process.env.DOLIBARR_URL || '',
   dolibarrApiKey: process.env.DOLIBARR_API_KEY || '',
-  dolibarrPayMethod: parseInt(process.env.PAY_METHOD || '2'),
-  alertEmail: process.env.ALERT_EMAIL || '',
+  dolibarrPayMethod: parseInt(process.env.DOLIBARR_PAY_METHOD || '2', 10),
   integrationActive: true,
 };
 
 // =============================================
-// LOGS EN MEMORIA (simple, sin base de datos)
+// LOGS EN MEMORIA
 // =============================================
 const syncLogs = [];
 const syncErrors = [];
+let logId = 0;
+let errId = 0;
 
 function addLog(tipo, titulo, detalle, orderNum) {
-  syncLogs.unshift({
-    id: syncLogs.length + 1,
-    tipo, titulo, detalle, orderNum: orderNum || '',
-    fecha: new Date().toISOString()
-  });
+  logId++;
+  syncLogs.unshift({ id: logId, tipo, titulo, detalle, orderNum: orderNum || '', fecha: new Date().toISOString() });
   if (syncLogs.length > 500) syncLogs.pop();
+  console.log(`[${tipo.toUpperCase()}] ${titulo} — ${detalle}`);
 }
 
 function addError(orderNum, tipo, mensaje) {
-  syncErrors.unshift({
-    id: syncErrors.length + 1,
-    orderNum, tipo, mensaje,
-    resuelto: false,
-    fecha: new Date().toISOString()
-  });
+  errId++;
+  syncErrors.unshift({ id: errId, orderNum, tipo, mensaje, resuelto: false, fecha: new Date().toISOString() });
+  console.error(`[ERROR] ${orderNum}: ${mensaje}`);
 }
 
 // =============================================
-// VERIFICAR QUE EL WEBHOOK VIENE DE SHOPIFY
+// SEGURIDAD: VERIFICAR QUE VIENE DE SHOPIFY
 // =============================================
 function verifyShopifyHmac(req) {
   const hmac = req.headers['x-shopify-hmac-sha256'];
   if (!hmac || !CONFIG.shopifyWebhookSecret) return false;
   try {
     const body = JSON.stringify(req.body);
-    const generated = crypto
-      .createHmac('sha256', CONFIG.shopifyWebhookSecret)
-      .update(body, 'utf8')
-      .digest('base64');
-    return crypto.timingSafeEqual(
-      Buffer.from(hmac, 'base64'),
-      Buffer.from(generated, 'base64')
-    );
-  } catch (e) {
-    return false;
-  }
+    const gen = crypto.createHmac('sha256', CONFIG.shopifyWebhookSecret).update(body, 'utf8').digest('base64');
+    return crypto.timingSafeEqual(Buffer.from(hmac, 'base64'), Buffer.from(gen, 'base64'));
+  } catch (e) { return false; }
 }
 
 // =============================================
-// LLAMAR A LA API DE DOLIBARR
+// CONECTAR CON DOLIBARR (Sin instalar axios)
 // =============================================
 function dolibarrApi(endpoint, method, data) {
   return new Promise((resolve) => {
-    const urlStr = CONFIG.dolibarrUrl + '/' + endpoint;
-    const url = new URL(urlStr);
-    const postData = data ? JSON.stringify(data) : null;
+    let urlStr = CONFIG.dolibarrUrl + '/' + endpoint;
+    let parsedUrl;
+    try { parsedUrl = new URL(urlStr); } catch (e) { return resolve({ ok: false, error: 'URL mala' }); }
 
-    const options = {
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname + url.search,
-      method: method || 'GET',
-      headers: {
-        'DOLAPIKEY': CONFIG.dolibarrApiKey,
-        'Content-Type': 'application/json',
-      },
+    const postData = data ? JSON.stringify(data) : null;
+    const mod = parsedUrl.protocol === 'https:' ? https : http;
+
+    const opts = {
+      hostname: parsedUrl.hostname, port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search, method: method || 'GET',
+      headers: { 'DOLAPIKEY': CONFIG.dolibarrApiKey, 'Content-Type': 'application/json' },
       timeout: 30000,
     };
+    if (postData) opts.headers['Content-Length'] = Buffer.byteLength(postData);
 
-    const req = https.request(options, (res) => {
+    const r = mod.request(opts, (res) => {
       let body = '';
-      res.on('data', (chunk) => body += chunk);
+      res.on('data', (c) => body += c);
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(body);
-          resolve({ success: true, data: parsed, status: res.statusCode });
-        } catch (e) {
-          resolve({ success: res.statusCode < 400, data: body, status: res.statusCode });
-        }
+        try { resolve({ ok: res.statusCode >= 200 && res.statusCode < 400, data: JSON.parse(body), status: res.statusCode }); }
+        catch (e) { resolve({ ok: res.statusCode < 400, data: body, status: res.statusCode }); }
       });
     });
-
-    req.on('error', (err) => {
-      resolve({ success: false, error: err.message, status: 0 });
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ success: false, error: 'Timeout', status: 0 });
-    });
-
-    if (postData) req.write(postData);
-    req.end();
+    r.on('error', (e) => resolve({ ok: false, error: e.message }));
+    r.on('timeout', () => { r.destroy(); resolve({ ok: false, error: 'Timeout' }); });
+    if (postData) r.write(postData);
+    r.end();
   });
 }
 
 // =============================================
-// LOGICA PRINCIPAL — PROCESAR UN PEDIDO
+// LOGICA PRINCIPAL: PROCESAR PEDIDO
 // =============================================
-async function procesarPedido(shopifyOrder) {
-  const orderNum = '#' + (shopifyOrder.order_number || shopifyOrder.id);
+async function procesarPedido(order) {
+  const num = '#' + (order.order_number || order.id || '?');
   const inicio = Date.now();
+  addLog('info', 'Webhook recibido: ' + num, 'Procesando...', num);
 
-  addLog('info', 'Webhook recibido: ' + orderNum, 'Topic: orders/paid', orderNum);
+  const email = order.email || '';
+  const ship = order.shipping_address || {};
+  const bill = order.billing_address || {};
+  const items = order.line_items || [];
+  const total = parseFloat(order.total_price) || 0;
+  const pago = order.payment_gateway || '';
 
-  // --- EXTRAER DATOS ---
-  const email = shopifyOrder.email || '';
-  const shipping = shopifyOrder.shipping_address || {};
-  const billing = shopifyOrder.billing_address || {};
-  const lineItems = shopifyOrder.line_items || [];
+  if (!email) { addLog('error', 'Error ' + num, 'Sin email', num); addError(num, 'critical', 'Sin email'); return; }
+  if (!items.length) { addLog('error', 'Error ' + num, 'Sin productos', num); addError(num, 'critical', 'Sin productos'); return; }
 
-  // Validar email
-  if (!email) {
-    const msg = 'Pedido sin email de cliente — imposible identificar';
-    addLog('error', 'Error en ' + orderNum, msg, orderNum);
-    addError(orderNum, 'critical', msg);
-    return { ok: false, error: msg };
-  }
+  const nombre = ((ship.first_name || bill.first_name || '') + ' ' + (ship.last_name || bill.last_name || '')).trim();
+  const dir = ship.address1 || bill.address1 || '';
+  const city = ship.city || bill.city || '';
+  const state = ship.province || bill.province || '';
+  const country = ship.country || bill.country || '';
+  const zip = ship.zip || bill.zip || '';
 
-  // Validar direccion
-  if (!shipping.address1 && !billing.address1) {
-    addLog('warning', 'Sin direccion en ' + orderNum, 'Se procesa igualmente', orderNum);
-  }
-
-  const nombre = (shipping.first_name || billing.first_name || '') + ' ' +
-                 (shipping.last_name || billing.last_name || '');
-  const dir = shipping.address1 || billing.address1 || '';
-  const ciudad = shipping.city || billing.city || '';
-  const provincia = shipping.province || billing.province || '';
-  const pais = shipping.country || billing.country || '';
-  const cp = shipping.zip || billing.zip || '';
-
-  // --- PASO A: BUSCAR O CREAR CLIENTE ---
-  addLog('info', 'Buscando cliente: ' + email, '', orderNum);
-
+  // PASO A: BUSCAR O CREAR CLIENTE
   let clientId;
+  const filtroEmail = encodeURIComponent("email='" + email + "'");
+  const busq = await dolibarrApi('thirdparties?sortfield=t.ref&sortorder=ASC&limit=100&filter=' + filtroEmail);
 
-  const busqueda = await dolibarrApi(
-    'thirdparties?sortfield=t.ref&sortorder=ASC&limit=100&filter=' +
-    encodeURIComponent('email=\'' + email + '\''),
-    'GET'
-  );
-
-  if (busqueda.success && Array.isArray(busqueda.data) && busqueda.data.length > 0) {
-    clientId = busqueda.data[0].id;
-    addLog('info', 'Cliente encontrado: ' + email, 'Dolibarr ID: ' + clientId, orderNum);
+  if (busq.ok && Array.isArray(busq.data) && busq.data.length > 0) {
+    clientId = busq.data[0].id;
+    addLog('info', 'Cliente encontrado: ' + email, 'ID: ' + clientId, num);
   } else {
-    addLog('info', 'Creando cliente: ' + email, '', orderNum);
-
-    const nuevoCliente = await dolibarrApi('thirdparties', 'POST', {
-      name: nombre.trim() || email.split('@')[0],
-      email: email,
-      address: dir,
-      town: ciudad,
-      state: provincia,
-      country: pais,
-      zip: cp,
-      client: 1,
-      status: 1,
-    });
-
-    if (nuevoCliente.success) {
-      clientId = nuevoCliente.data;
-      addLog('success', 'Cliente creado: ' + email, 'Dolibarr ID: ' + clientId, orderNum);
-    } else {
-      const msg = 'No se pudo crear cliente: ' + (nuevoCliente.error || 'error desconocido');
-      addLog('error', 'Error cliente en ' + orderNum, msg, orderNum);
-      addError(orderNum, 'critical', msg);
-      return { ok: false, error: msg };
-    }
+    addLog('info', 'Creando cliente: ' + email, '', num);
+    const crear = await dolibarrApi('thirdparties', 'POST', { name: nombre || email.split('@')[0], email, address: dir, town: city, state, country, zip, client: 1, status: 1 });
+    if (crear.ok) { clientId = crear.data; addLog('success', 'Cliente creado: ' + email, 'ID: ' + clientId, num); }
+    else { addLog('error', 'Error cliente ' + num, crear.error || 'Desconocido', num); addError(num, 'critical', 'No se pudo crear cliente'); return; }
   }
 
-  // --- PASO B: CREAR PEDIDO CON LINEAS ---
-  addLog('info', 'Creando pedido en Dolibarr: ' + orderNum, 'Cliente: ' + clientId, orderNum);
-
+  // PASO B: MAPEAR PRODUCTOS
   const lineas = [];
-  let skusFaltantes = [];
-
-  for (let i = 0; i < lineItems.length; i++) {
-    const item = lineItems[i];
-    const sku = item.sku || '';
-    const qty = item.quantity || 1;
+  const faltantes = [];
+  for (const item of items) {
+    const sku = (item.sku || '').trim();
+    const qty = parseInt(item.quantity, 10) || 1;
     const precio = parseFloat(item.price) || 0;
+    const desc = item.title || 'Sin nombre';
 
-    if (!sku) {
-      skusFaltantes.push('(sin SKU) ' + item.title);
-      continue;
-    }
+    if (!sku) { faltantes.push('(sin SKU) ' + desc); continue; }
 
-    const buscarProd = await dolibarrApi(
-      'products?sortfield=t.ref&sortorder=ASC&limit=100&filter=' +
-      encodeURIComponent('t.ref=\'' + sku + '\''),
-      'GET'
-    );
-
-    if (buscarProd.success && Array.isArray(buscarProd.data) && buscarProd.data.length > 0) {
-      lineas.push({
-        fk_product: buscarProd.data[0].id,
-        qty: qty,
-        subprice: precio,
-        desc: item.title,
-        product_type: 0,
-      });
+    const filtroSku = encodeURIComponent("t.ref='" + sku + "'");
+    const prod = await dolibarrApi('products?sortfield=t.ref&sortorder=ASC&limit=100&filter=' + filtroSku);
+    if (prod.ok && Array.isArray(prod.data) && prod.data.length > 0) {
+      lineas.push({ fk_product: prod.data[0].id, qty, subprice: precio, desc, product_type: 0 });
     } else {
-      skusFaltantes.push(sku + ' — ' + item.title);
-      addLog('warning', 'SKU no encontrado: ' + sku, item.title, orderNum);
+      faltantes.push(sku + ' — ' + desc);
+      addLog('warning', 'SKU no encontrado: ' + sku, desc, num);
     }
   }
 
-  if (lineas.length === 0) {
-    const msg = 'Ningun SKU existe en Dolibarr. Faltantes: ' + skusFaltantes.join(', ');
-    addLog('error', 'Error en ' + orderNum, msg, orderNum);
-    addError(orderNum, 'critical', msg);
-    return { ok: false, error: msg };
-  }
+  if (lineas.length === 0) { addLog('error', 'Error ' + num, 'Ningun SKU valido', num); addError(num, 'critical', 'Sin SKUs validos'); return; }
 
-  const crearPedido = await dolibarrApi('orders', 'POST', {
-    socid: clientId,
-    date: Math.floor(new Date(shopifyOrder.created_at).getTime() / 1000),
-    lines: lineas,
-    note_private: 'Shopify ' + orderNum + ' — Pago: ' + (shopifyOrder.payment_gateway || ''),
-    fk_cond_reglement: CONFIG.dolibarrPayMethod,
-  });
+  // PASO B2: CREAR PEDIDO
+  addLog('info', 'Creando pedido Dolibarr: ' + num, '', num);
+  const pedidoRes = await dolibarrApi('orders', 'POST', { socid: clientId, date: Math.floor(new Date(order.created_at).getTime() / 1000), lines: lineas, note_private: 'Shopify ' + num + ' — ' + pago, fk_cond_reglement: CONFIG.dolibarrPayMethod });
+  
+  if (!pedidoRes.ok) { addLog('error', 'Error pedido ' + num, pedidoRes.error || 'Desconocido', num); addError(num, 'critical', 'No se creo pedido'); return; }
+  const pedidoId = pedidoRes.data;
+  addLog('success', 'Pedido creado: ' + num, 'ID: ' + pedidoId, num);
 
-  if (!crearPedido.success) {
-    const msg = 'Error creando pedido: ' + (crearPedido.error || 'desconocido');
-    addLog('error', 'Error en ' + orderNum, msg, orderNum);
-    addError(orderNum, 'critical', msg);
-    return { ok: false, error: msg };
-  }
-
-  const pedidoId = crearPedido.data;
-  addLog('success', 'Pedido creado: ' + orderNum, 'Dolibarr ID: ' + pedidoId, orderNum);
-
-  // --- PASO C: VALIDAR Y CREAR FACTURA ---
+  // PASO C: VALIDAR, FACTURAR, PAGAR
   await dolibarrApi('orders/' + pedidoId + '/validate', 'POST', {});
+  const factRes = await dolibarrApi('orders/' + pedidoId + '/createinvoicewithdelayedlines', 'POST', {});
+  let factId = null;
 
-  const factura = await dolibarrApi(
-    'orders/' + pedidoId + '/createinvoicewithdelayedlines', 'POST', {}
-  );
-
-  let facturaId = null;
-  if (factura.success) {
-    facturaId = factura.data;
-    addLog('success', 'Factura creada: ' + orderNum, 'Dolibarr ID: ' + facturaId, orderNum);
-
-    const total = parseFloat(shopifyOrder.total_price) || 0;
-    await dolibarrApi('invoices/' + facturaId + '/pay', 'POST', {
-      amount: total,
-      fk_typepayment: CONFIG.dolibarrPayMethod,
-      datepay: Math.floor(Date.now() / 1000),
-      note: 'Pago auto Shopify ' + orderNum,
-    });
-    addLog('success', 'Factura pagada: ' + facturaId, '$' + total, orderNum);
+  if (factRes.ok) {
+    factId = factRes.data;
+    addLog('success', 'Factura creada: ' + num, 'ID: ' + factId, num);
+    await dolibarrApi('invoices/' + factId + '/pay', 'POST', { amount: total, fk_typepayment: CONFIG.dolibarrPayMethod, datepay: Math.floor(Date.now() / 1000), closepaid: 'yes' });
+    addLog('success', 'Factura pagada', '$' + total, num);
+  } else {
+    addLog('warning', 'No se creo factura ' + num, '', num);
   }
 
-  // --- RESULTADO ---
   const duracion = Date.now() - inicio;
-
-  if (skusFaltantes.length > 0) {
-    const msg = 'Parcial. SKUs faltantes: ' + skusFaltantes.join(', ');
-    addLog('warning', orderNum + ' parcial', msg, orderNum);
-    addError(orderNum, 'warning', msg);
-    return { ok: 'partial', pedidoId, facturaId, duracion };
-  }
-
-  addLog('success', orderNum + ' completado', pedidoId + ' / ' + facturaId + ' — ' + duracion + 'ms', orderNum);
-  return { ok: true, pedidoId, facturaId, duracion };
+  if (faltantes.length > 0) { addLog('warning', num + ' Parcial', faltantes.join(', '), num); addError(num, 'warning', 'Parcial: ' + faltantes.join(', ')); }
+  else { addLog('success', num + ' COMPLETADO', pedidoId + '/' + factId + ' — ' + duracion + 'ms', num); }
 }
 
 // =============================================
-// WEBHOOK — LO QUE SHOPIFY LLAMA
+// ENDPOINTS
 // =============================================
+// Webhook de Shopify
 app.post('/webhook/shopify/orders-paid', (req, res) => {
   if (!CONFIG.integrationActive) return res.status(200).send('Off');
-  if (!verifyShopifyHmac(req)) {
-    addLog('error', 'HMAC invalido', 'Webhook rechazado — posible falsificacion', '');
-    return res.status(401).send('HMAC invalid');
-  }
+  if (!verifyShopifyHmac(req)) return res.status(401).send('HMAC invalid');
   res.status(200).send('OK');
-  procesarPedido(req.body).catch((err) => {
-    addLog('error', 'Excepcion', err.message, '');
-  });
+  procesarPedido(req.body).catch(e => addLog('error', 'Excepcion', e.message, ''));
 });
 
-// =============================================
-// SERVIR EL PANEL HTML
-// =============================================
-app.get('/', (req, res) => {
-  res.sendFile(__dirname + '/index.html');
-});
-app.get('/index.html', (req, res) => {
-  res.sendFile(__dirname + '/index.html');
-});
+// APIs para el panel
+app.get('/api/stats', (req, res) => res.json({
+  pedidos: syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('COMPLETADO')).length,
+  facturas: syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('Factura')).length,
+  clientes: syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('Cliente creado')).length,
+  errores: syncErrors.filter(e => !e.resuelto).length,
+}));
+app.get('/api/logs', (req, res) => res.json(syncLogs.slice(0, 200)));
+app.get('/api/errors', (req, res) => res.json(syncErrors.filter(e => !e.resuelto)));
+app.put('/api/errors/:id/resolve', (req, res) => { const e = syncErrors.find(x => x.id == req.params.id); if (e) e.resuelto = true; res.json({ ok: true }); });
+app.post('/api/errors/resolve-all', (req, res) => { syncErrors.forEach(e => e.resuelto = true); res.json({ ok: true }); });
+app.post('/api/sync/manual', (req, res) => res.json({ ok: true, message: 'Sync manual' }));
+app.delete('/api/logs', (req, res) => { syncLogs.length = 0; res.json({ ok: true }); });
+app.get('/api/config', (req, res) => res.json({ shopifyShop: CONFIG.shopifyShop, dolibarrUrl: CONFIG.dolibarrUrl.replace(/\/api.*$/, ''), integrationActive: CONFIG.integrationActive }));
+app.post('/api/toggle', (req, res) => { CONFIG.integrationActive = !CONFIG.integrationActive; res.json({ active: CONFIG.integrationActive }); });
 
-// =============================================
-// API PARA EL PANEL
-// =============================================
-app.get('/api/stats', (req, res) => {
-  const pedidos = syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('completado')).length;
-  const facturas = syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('Factura')).length;
-  const clientes = syncLogs.filter(l => l.tipo === 'success' && l.titulo.includes('Cliente creado')).length;
-  const errores = syncErrors.filter(e => !e.resuelto).length;
-  res.json({ pedidos, facturas, clientes, errores });
-});
-
-app.get('/api/logs', (req, res) => {
-  res.json(syncLogs.slice(0, 200));
-});
-
-app.get('/api/errors', (req, res) => {
-  res.json(syncErrors.filter(e => !e.resuelto));
-});
-
-app.put('/api/errors/:id/resolve', (req, res) => {
-  const err = syncErrors.find(e => e.id == req.params.id);
-  if (err) err.resuelto = true;
-  res.json({ ok: true });
-});
-
-app.post('/api/sync/manual', (req, res) => {
-  res.json({ ok: true, message: 'No hay pedidos pendientes' });
-});
-
-app.delete('/api/logs', (req, res) => {
-  syncLogs.length = 0;
-  res.json({ ok: true });
-});
-
-app.get('/api/config', (req, res) => {
-  res.json({
-    shopifyShop: CONFIG.shopifyShop,
-    dolibarrUrl: CONFIG.dolibarrUrl.replace(/\/api.*$/, ''),
-    integrationActive: CONFIG.integrationActive,
-  });
-});
-
-app.post('/api/toggle', (req, res) => {
-  CONFIG.integrationActive = !CONFIG.integrationActive;
-  res.json({ active: CONFIG.integrationActive });
-});
-
-// =============================================
-// INICIAR
-// =============================================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('SyncBridge corriendo en puerto ' + PORT);
-});
+// Puerto dinamico de Railway
+const PORT = process.env.PORT || 3099;
+app.listen(PORT, () => console.log('SyncBridge corriendo en puerto ' + PORT));
